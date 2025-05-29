@@ -3,12 +3,48 @@ import concurrent.futures
 import cv2
 import numpy as np
 from tqdm.auto import tqdm
+from scipy.signal import find_peaks as scipy_find_peaks
+from scipy.signal import peak_widths
+from cellpose import models
+
+
+def segment_images(
+    model: models.CellposeModel, 
+    frames: list[np.ndarray],
+    *,
+    flow_threshold: float = 0.4,
+    cellprob_threshold: float = 0,
+    tile_norm_blocksize: int = 0,
+    batch_size: int = 32,
+    niter: int | None = None,
+    diameter: int | None = None,
+    ) -> list[np.ndarray]:
+    """
+    Segment the frames using the Cellpose model.
+    """
+    masks, _, _ = model.eval(
+        x=frames, 
+        batch_size=batch_size, 
+        flow_threshold=flow_threshold, 
+        cellprob_threshold=cellprob_threshold,
+        normalize={"tile_norm_blocksize": tile_norm_blocksize}, # type: ignore
+        niter=niter,
+        diameter=diameter,
+        channel_axis=2,
+    )
+    return masks
 
 
 def parse_cells_mask(mask: np.ndarray) -> dict[int, np.ndarray]:
     cell_ids = np.unique(mask)
     cell_ids = cell_ids[cell_ids > 0]
     return {cell_id: mask == cell_id for cell_id in cell_ids}
+
+
+def select_region_by_mask(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    frame_copy = frame.copy()
+    frame_copy[~mask] = 0
+    return frame_copy
 
 
 def calculate_center_of_mass(image: np.ndarray) -> tuple[float, float]:
@@ -154,3 +190,164 @@ def calculate_flow_field(frames: list[np.ndarray], mask: np.ndarray, threshold: 
         results.append(results[-1] if results else {})
     
     return results
+
+
+def find_moving_wavefront(frames: list[np.ndarray]) -> list[np.ndarray]:
+    """
+    Detect moving wavefronts in video frames using optical flow and create masks for each frame.
+    
+    Args:
+        frames (list[np.ndarray]): List of image frames
+        
+    Returns:
+        list[np.ndarray]: List of binary masks where 255 indicates moving wavefront regions
+    """
+    if not frames:
+        return []
+    
+    # Initialize list to store masks
+    wavefront_masks = []
+    
+    # Preprocess first frame
+    def preprocess(frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        corners = cv2.goodFeaturesToTrack(
+            gray, maxCorners=200, qualityLevel=0.01, minDistance=10
+        )
+        return gray, corners
+    
+    # Initialize with first frame
+    prev_gray, prev_pts = preprocess(frames[0])
+    
+    # Create initial mask (will be empty for first frame)
+    initial_mask = np.zeros_like(frames[0])
+    if len(initial_mask.shape) == 3:
+        initial_mask = cv2.cvtColor(initial_mask, cv2.COLOR_RGB2GRAY)
+    wavefront_masks.append(initial_mask)
+    
+    # Process each subsequent frame
+    for i in range(1, len(frames)):
+        # Create mask for current frame
+        mask = np.zeros_like(frames[i])
+        if len(mask.shape) == 3:
+            mask = cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
+        
+        curr_gray, curr_pts = preprocess(frames[i])
+        
+        # Skip if no features found in previous frame
+        if prev_pts is None:
+            wavefront_masks.append(mask)
+            prev_gray = curr_gray.copy()
+            prev_pts = curr_pts
+            continue
+        
+        # Calculate optical flow
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, curr_gray, prev_pts, None, winSize=(15, 15), maxLevel=2 # type: ignore
+        ) # type: ignore
+        
+        # Skip if no flow vectors found
+        if curr_pts is None or status is None:
+            wavefront_masks.append(mask)
+            prev_gray = curr_gray.copy()
+            prev_pts = curr_pts
+            continue
+        
+        # Get valid points
+        good_new = curr_pts[status == 1]
+        good_old = prev_pts[status == 1]
+        
+        # Draw flow vectors on mask
+        for (new, old) in zip(good_new, good_old):
+            a, b = new.ravel()
+            c, d = old.ravel()
+            # Draw line between old and new position
+            cv2.line(mask, (int(a), int(b)), (int(c), int(d)), 255, 2) # type: ignore
+            # Draw circle at new position
+            cv2.circle(mask, (int(a), int(b)), 5, 255, -1) # type: ignore
+        
+        # Apply morphological operations to enhance the mask
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
+        
+        wavefront_masks.append(mask)
+        
+        # Update for next iteration
+        prev_gray = curr_gray.copy()
+        prev_pts = good_new.reshape(-1, 1, 2)
+    
+    return wavefront_masks
+
+
+def find_peaks(data, height_threshold=None, distance=None):
+    """
+    Find peaks in a 1D array of data.
+    
+    Args:
+        data (list or np.ndarray): The data to analyze
+        height_threshold (float, optional): Minimum height for a peak to be considered
+        distance (int, optional): Minimum distance between peaks
+        
+    Returns:
+        np.ndarray: Indices of the peaks in the data
+    """
+    
+    if height_threshold is None:
+        # Default to 60% of the data range
+        height_threshold = np.min(data) + 0.6 * (np.max(data) - np.min(data))
+    
+    if distance is None:
+        # Default to 5% of the data length
+        distance = max(int(len(data) * 0.05), 1)
+    
+    peaks, _ = scipy_find_peaks(data, height=height_threshold, distance=distance)
+    return peaks
+
+
+def measure_peak_widths(data, peaks, height_threshold=None, rel_height=0.5):
+    """
+    Measure the width of each peak in the data.
+    
+    Parameters:
+    -----------
+    data : array-like
+        The intensity data containing peaks
+    peaks : array-like
+        Indices of the peaks in the data
+    height_threshold : float, optional
+        Minimum height for a peak to be considered. If None, all peaks are considered.
+    rel_height : float, optional
+        The relative height at which the peak width is measured.
+        Default is 0.5 (half height), which gives the full width at half maximum (FWHM).
+    
+    Returns:
+    --------
+    widths : array
+        The width of each peak
+    width_heights : array
+        The height at which the width is measured for each peak
+    left_ips : array
+        The interpolated left edge positions of each peak
+    right_ips : array
+        The interpolated right edge positions of each peak
+    """
+    
+    # Filter peaks by height if threshold is provided
+    if height_threshold is not None:
+        valid_peaks = [p for p in peaks if data[p] >= height_threshold]
+    else:
+        valid_peaks = peaks
+    
+    if len(valid_peaks) == 0:
+        raise ValueError("No valid peaks found")
+    
+    # Convert valid_peaks to numpy array if it's not already
+    valid_peaks = np.array(valid_peaks)
+    
+    # Calculate peak widths
+    # The rel_height parameter determines at what fraction of the peak height the width is measured
+    # 0.5 means half the height (FWHM), 0.9 means 90% of the height (narrower width)
+    widths, width_heights, left_ips, right_ips = peak_widths(data, valid_peaks, rel_height=rel_height)
+    
+    return widths, width_heights, left_ips, right_ips
