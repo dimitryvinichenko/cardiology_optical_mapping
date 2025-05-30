@@ -49,6 +49,14 @@ def create_video_from_frames(
             # Ensure frame is in the correct format (uint8)
             if frame.dtype != np.uint8:
                 frame = (frame * 255).astype(np.uint8)
+            
+            # Handle grayscale frames if is_color is True
+            if is_color and len(frame.shape) == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            # Handle color frames if is_color is False
+            elif not is_color and len(frame.shape) == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                
             out.write(frame)
     finally:
         # Release the video writer
@@ -123,3 +131,32 @@ def add_dot_on_frame(frame: np.ndarray, dot_position: tuple[int, int], color: tu
     frame = frame.copy()
     cv2.circle(frame, dot_position, radius, color, -1)
     return frame
+
+
+def visualize_contours(frames, contours_per_frame, color=(0, 255, 0), thickness=2):
+    """
+    Draw contours on frames.
+    
+    Args:
+        frames (list[np.ndarray]): List of original frames
+        contours_per_frame (list): List of contours for each frame
+        color (tuple, optional): Color of contours. Defaults to (0, 255, 0).
+        thickness (int, optional): Thickness of contour lines. Defaults to 2.
+        
+    Returns:
+        list[np.ndarray]: Frames with contours drawn
+    """
+    frames_with_contours = []
+    
+    for i, frame in enumerate(frames):
+        # Create a copy of the original frame
+        frame_copy = frame.copy()
+        
+        # If we have contours for this frame, draw them
+        if i < len(contours_per_frame):
+            # Draw all contours on the frame
+            cv2.drawContours(frame_copy, contours_per_frame[i], -1, color, thickness)
+        
+        frames_with_contours.append(frame_copy)
+    
+    return frames_with_contours

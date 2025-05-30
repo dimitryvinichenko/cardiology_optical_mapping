@@ -2,10 +2,10 @@ import concurrent.futures
 
 import cv2
 import numpy as np
-from tqdm.auto import tqdm
+from cellpose import models
 from scipy.signal import find_peaks as scipy_find_peaks
 from scipy.signal import peak_widths
-from cellpose import models
+from tqdm.auto import tqdm
 
 
 def segment_images(
@@ -52,16 +52,21 @@ def calculate_center_of_mass(image: np.ndarray) -> tuple[float, float]:
     Calculate the center of mass of an image represented as a NumPy array.
     
     Args:
-        image (np.ndarray): Input image array of shape (h, w, 3)
+        image (np.ndarray): Input image array of shape (h, w) for grayscale
+                           or (h, w, 3) for RGB
         
     Returns:
         tuple[float, float]: (x, y) coordinates of the center of mass
     """
-    if image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError("Input array must have shape (h, w, 3)")
-    
-    # Convert to grayscale using cv2
-    grayscale = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    # Handle grayscale or RGB images
+    if image.ndim == 3 and image.shape[2] == 3:
+        # Convert RGB to grayscale
+        grayscale = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    elif image.ndim == 2:
+        # Already grayscale
+        grayscale = image
+    else:
+        raise ValueError("Input array must have shape (h, w) for grayscale or (h, w, 3) for RGB")
     
     # Create coordinate grids
     h, w = grayscale.shape
@@ -121,163 +126,6 @@ def get_cells_center_of_masses(frames: list[np.ndarray], mask: np.ndarray, max_w
             results.append(result)
     
     return results
-
-
-def calculate_flow_field(frames: list[np.ndarray], mask: np.ndarray, threshold: int = 25) -> list[dict[int, tuple[int, int]]]:
-    """
-    Calculate the center of moving clouds (flowing liquid) in each frame.
-    
-    Args:
-        frames (list[np.ndarray]): List of image frames
-        mask (np.ndarray): Mask to identify regions of interest
-        
-    Returns:
-        list[dict[int, tuple[int, int]]]: List of dictionaries mapping region IDs to their flow centers
-    """
-    # Parse the mask to identify different regions
-    regions = parse_cells_mask(mask)
-    
-    # Initialize results list to store flow centers for each frame
-    results = []
-    
-    # Dictionary to track the last known flow center for each region
-    last_flow_centers = {}
-    
-    # Process each frame
-    for i in tqdm(range(len(frames) - 1), desc="Calculating flow field"):
-        current_frame = frames[i]
-        next_frame = frames[i + 1]
-        
-        # Dictionary to store flow centers for this frame
-        flow_centers = {}
-        
-        # Process each region in the mask
-        for region_id, region_mask in regions.items():
-            # Apply mask to current and next frame
-            current_region = current_frame.copy()
-            current_region[~region_mask] = 0
-            
-            next_region = next_frame.copy()
-            next_region[~region_mask] = 0
-            
-            # Calculate difference to identify movement
-            diff = cv2.absdiff(current_region, next_region)
-            diff_gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY) if diff.shape[-1] == 3 else diff
-            
-            # Apply threshold to highlight significant movement
-            _, thresh = cv2.threshold(diff_gray, threshold, 255, cv2.THRESH_BINARY)
-            
-            # Find center of the moving cloud
-            if np.sum(thresh) > 0:  # Check if there's any movement # type: ignore
-                # Convert thresh to 3-channel image for get_center_of_mass_indices
-                thresh_3ch = np.stack([thresh, thresh, thresh], axis=2)
-                flow_center = get_center_of_mass_indices(thresh_3ch)
-                flow_centers[region_id] = flow_center
-                # Update last known position
-                last_flow_centers[region_id] = flow_center
-            else:
-                # If no movement detected, use the last known position if available
-                if region_id in last_flow_centers:
-                    flow_centers[region_id] = last_flow_centers[region_id]
-                else:
-                    # If no previous position, use the center of the region
-                    flow_centers[region_id] = get_center_of_mass_indices(current_region)
-        
-        results.append(flow_centers)
-    
-    # For the last frame, use the same flow centers as the previous frame
-    if frames:
-        results.append(results[-1] if results else {})
-    
-    return results
-
-
-def find_moving_wavefront(frames: list[np.ndarray]) -> list[np.ndarray]:
-    """
-    Detect moving wavefronts in video frames using optical flow and create masks for each frame.
-    
-    Args:
-        frames (list[np.ndarray]): List of image frames
-        
-    Returns:
-        list[np.ndarray]: List of binary masks where 255 indicates moving wavefront regions
-    """
-    if not frames:
-        return []
-    
-    # Initialize list to store masks
-    wavefront_masks = []
-    
-    # Preprocess first frame
-    def preprocess(frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        corners = cv2.goodFeaturesToTrack(
-            gray, maxCorners=200, qualityLevel=0.01, minDistance=10
-        )
-        return gray, corners
-    
-    # Initialize with first frame
-    prev_gray, prev_pts = preprocess(frames[0])
-    
-    # Create initial mask (will be empty for first frame)
-    initial_mask = np.zeros_like(frames[0])
-    if len(initial_mask.shape) == 3:
-        initial_mask = cv2.cvtColor(initial_mask, cv2.COLOR_RGB2GRAY)
-    wavefront_masks.append(initial_mask)
-    
-    # Process each subsequent frame
-    for i in range(1, len(frames)):
-        # Create mask for current frame
-        mask = np.zeros_like(frames[i])
-        if len(mask.shape) == 3:
-            mask = cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
-        
-        curr_gray, curr_pts = preprocess(frames[i])
-        
-        # Skip if no features found in previous frame
-        if prev_pts is None:
-            wavefront_masks.append(mask)
-            prev_gray = curr_gray.copy()
-            prev_pts = curr_pts
-            continue
-        
-        # Calculate optical flow
-        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-            prev_gray, curr_gray, prev_pts, None, winSize=(15, 15), maxLevel=2 # type: ignore
-        ) # type: ignore
-        
-        # Skip if no flow vectors found
-        if curr_pts is None or status is None:
-            wavefront_masks.append(mask)
-            prev_gray = curr_gray.copy()
-            prev_pts = curr_pts
-            continue
-        
-        # Get valid points
-        good_new = curr_pts[status == 1]
-        good_old = prev_pts[status == 1]
-        
-        # Draw flow vectors on mask
-        for (new, old) in zip(good_new, good_old):
-            a, b = new.ravel()
-            c, d = old.ravel()
-            # Draw line between old and new position
-            cv2.line(mask, (int(a), int(b)), (int(c), int(d)), 255, 2) # type: ignore
-            # Draw circle at new position
-            cv2.circle(mask, (int(a), int(b)), 5, 255, -1) # type: ignore
-        
-        # Apply morphological operations to enhance the mask
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
-        
-        wavefront_masks.append(mask)
-        
-        # Update for next iteration
-        prev_gray = curr_gray.copy()
-        prev_pts = good_new.reshape(-1, 1, 2)
-    
-    return wavefront_masks
 
 
 def find_peaks(data, height_threshold=None, distance=None):
@@ -351,3 +199,88 @@ def measure_peak_widths(data, peaks, height_threshold=None, rel_height=0.5):
     widths, width_heights, left_ips, right_ips = peak_widths(data, valid_peaks, rel_height=rel_height)
     
     return widths, width_heights, left_ips, right_ips
+
+
+def find_contours(frames, threshold=20):
+    """
+    Find contours in grayscale frames.
+    
+    Args:
+        frames (list[np.ndarray]): List of grayscale frames
+        threshold (int, optional): Threshold value for binary conversion. Defaults to 20.
+        
+    Returns:
+        list: List of contours for each frame
+    """
+    contours_per_frame = []
+    
+    for frame in frames:
+        # Threshold the image to create a binary image
+        _, binary_frame = cv2.threshold(frame, threshold, 255, cv2.THRESH_BINARY)
+        
+        # Find contours in the binary image
+        contours, _ = cv2.findContours(binary_frame, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        contours_per_frame.append(contours)
+    
+    return contours_per_frame
+
+
+def calculate_contour_speed(contours_per_frame, time_interval=1.0, min_contour_area=10):
+    """
+    Calculate the speed of moving contours across frames.
+    
+    Args:
+        contours_per_frame (list): List of contours for each frame
+        time_interval (float, optional): Time between frames in seconds. Defaults to 1.0.
+        min_contour_area (float, optional): Minimum contour area to consider. Defaults to 10.
+        
+    Returns:
+        dict: Dictionary containing:
+            - 'speeds': List of speeds between consecutive frames (pixels/time_interval)
+            - 'avg_speed': Average speed across all frames
+            - 'centroid_positions': List of centroid positions for each frame
+    """
+    centroids = []
+    speeds = []
+    
+    for frame_contours in contours_per_frame:
+        frame_centroids = []
+        
+        for contour in frame_contours:
+            # Filter out small contours
+            area = cv2.contourArea(contour)
+            if area < min_contour_area:
+                continue
+                
+            # Calculate centroid of contour
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                frame_centroids.append((cx, cy))
+        
+        # Use the largest contour's centroid if multiple are found
+        if frame_centroids:
+            centroids.append(frame_centroids[0])  # Simplified - could be improved
+    
+    # Calculate speeds between consecutive frames
+    for i in range(1, len(centroids)):
+        prev_x, prev_y = centroids[i-1]
+        curr_x, curr_y = centroids[i]
+        
+        # Calculate Euclidean distance
+        distance = np.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
+        
+        # Speed = distance / time
+        speed = distance / time_interval
+        speeds.append(speed)
+    
+    # Calculate average speed
+    avg_speed = np.mean(speeds) if speeds else 0
+    
+    return {
+        'speeds': speeds,
+        'avg_speed': avg_speed,
+        'centroid_positions': centroids
+    }
